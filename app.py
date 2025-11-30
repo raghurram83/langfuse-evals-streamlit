@@ -22,12 +22,26 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 from openai import OpenAI, OpenAIError
+import sys
+
+# Ensure UTF-8 for I/O to avoid ascii codec issues.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 
 # -----------------------------
 # Requirements generator section
 # -----------------------------
 REQUIREMENTS = ["streamlit", "pandas", "openai"]
+
+
+def sanitize_text(text: str) -> str:
+    """Remove problematic Unicode separators that can break encoding."""
+    return text.replace("\u2028", " ").replace("\u2029", " ").strip()
+
 
 SAMPLE_TRANSCRIPTS = {
     "Agent Nisha - IVR pricing (en)": """[00:00:00] Customer: Hello.
@@ -343,8 +357,7 @@ def parse_transcript(content: bytes, filename: str) -> List[str]:
     name = filename.lower()
     text_lines: List[str] = []
     def _clean(line: str) -> str:
-        # Replace Unicode line separators that can break encoding/rendering.
-        return line.replace("\u2028", " ").replace("\u2029", " ").strip()
+        return sanitize_text(line)
     if name.endswith(".txt"):
         text = content.decode("utf-8", errors="ignore")
         text_lines = [_clean(line) for line in text.splitlines() if _clean(line)]
@@ -391,7 +404,7 @@ def normalize_lines(lines: List[str]) -> pd.DataFrame:
     """Detect speaker labels and normalize to dataframe."""
     records = []
     for line in lines:
-        line = line.replace("\u2028", " ").replace("\u2029", " ").strip()
+        line = sanitize_text(line)
         speaker = "Unknown"
         raw_text = line
         if line.lower().startswith("agent:"):
@@ -438,16 +451,23 @@ STRICT RULES:
 - Do not invent or rephrase agent prompts as FAQs.
 
 Identify question intent even when no '?' is present.
-Return structured JSON list:
-[
-  { "question": "...", "answer": "...", "confidence": 0-1 }
-]
-Score must reflect answer completeness.
-0.8+ = strong, 0.5–0.79 = medium, <0.5 = weak.
+Respond ONLY with JSON (no prose, no markdown).
+Return either a list or an object with key "faqs" containing the list.
+Each FAQ object fields:
+- question (string)
+- answer (string)
+- confidence (0-1)
+- question_confidence (0-1)
+- answer_confidence (0-1)
+- relevance_score (0-1)
+- completeness_score (0-1)
+- redundancy_score (0-1)
+- pii_removed (boolean)
 """
 
 
 def extract_faq_via_llm(cleaned_transcript: str, model: str, api_key: str) -> List[Dict[str, Any]]:
+    """Call OpenAI and robustly parse JSON FAQs."""
     if not api_key:
         raise ValueError("OpenAI API key is required for FAQ extraction.")
     client = OpenAI(api_key=api_key)
@@ -456,14 +476,17 @@ def extract_faq_via_llm(cleaned_transcript: str, model: str, api_key: str) -> Li
         {"role": "user", "content": cleaned_transcript},
     ]
     try:
-        kwargs: Dict[str, Any] = {"model": model, "messages": messages, "temperature": 0.2}
-        # Some newer models expect max_completion_tokens instead of max_tokens.
+        # GPT-5 models can be strict about params; send minimal payload.
         if model.startswith("gpt-5"):
-            kwargs["max_completion_tokens"] = 800
+            resp = client.chat.completions.create(model=model, messages=messages)
         else:
-            kwargs["max_tokens"] = 800
-        resp = client.chat.completions.create(**kwargs)
-        content = resp.choices[0].message.content
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=800,
+            )
+        content = sanitize_text(resp.choices[0].message.content)
     except OpenAIError as exc:
         raise RuntimeError(f"OpenAI API error: {exc}") from exc
 
@@ -471,15 +494,36 @@ def extract_faq_via_llm(cleaned_transcript: str, model: str, api_key: str) -> Li
     return faqs, content
 
 
+def _strip_code_fences(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        # remove first fence
+        t = t.lstrip("`")
+        # drop possible language hint
+        parts = t.split("\n", 1)
+        if len(parts) == 2:
+            t = parts[1]
+    if t.endswith("```"):
+        t = t[: -3]
+    return t.strip()
+
+
 def _parse_json_loose(text: str) -> List[Dict[str, Any]]:
     """Try strict JSON first; then fallback to bracketed content extraction."""
+    text = sanitize_text(text)
+    text = _strip_code_fences(text)
+    # Direct parse
     try:
         data = json.loads(text)
         if isinstance(data, list):
             return data
+        if isinstance(data, dict):
+            for key in ("faqs", "data", "items", "results"):
+                if key in data and isinstance(data[key], list):
+                    return data[key]
     except Exception:
         pass
-    # fallback: find first [...] block
+    # find first [...] block
     start = text.find("[")
     end = text.rfind("]")
     if start != -1 and end != -1 and end > start:
@@ -607,7 +651,7 @@ if uploads:
 if manual_text.strip():
     raw_lines.extend(
         [
-            line.replace("\u2028", " ").replace("\u2029", " ").strip()
+            sanitize_text(line)
             for line in manual_text.splitlines()
             if line.strip()
         ]
@@ -639,14 +683,16 @@ if st.sidebar.button("Run FAQ Extraction", type="primary"):
     with st.spinner("Extracting FAQs via OpenAI..."):
         try:
             faq_results, raw_llm_response = extract_faq_via_llm(transcript_used, model, openai_api_key)
+            if raw_llm_response:
+                raw_llm_response = sanitize_text(raw_llm_response)
             if not faq_results:
                 faq_error = "No FAQs returned or unable to parse JSON."
             else:
                 scorer = FAQScorer()
                 for item in faq_results:
                     enriched = {
-                        "question": item.get("question", "").replace("\u2028", " ").replace("\u2029", " ").strip(),
-                        "answer": item.get("answer", "").replace("\u2028", " ").replace("\u2029", " ").strip(),
+                        "question": sanitize_text(item.get("question", "")),
+                        "answer": sanitize_text(item.get("answer", "")),
                         "confidence": float(item.get("confidence", 0) or 0),
                         # Defaults for scoring; can be extended with real signals
                         "question_confidence": float(item.get("confidence", 0) or 0),
