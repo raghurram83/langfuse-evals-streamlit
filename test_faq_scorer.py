@@ -105,6 +105,45 @@ class TestFAQScorer(unittest.TestCase):
         result = self.scorer.score_faq(faq)
         self.assertEqual(result["decision"], "ACCEPT")
 
+    def test_reject_agent_name(self):
+        faq = {
+            "question_confidence": 0.9,
+            "answer_confidence": 0.9,
+            "relevance_score": 0.9,
+            "completeness_score": 0.9,
+            "redundancy_score": 0.1,
+            "pii_removed": True,
+            "name_flag": True,
+        }
+        result = self.scorer.score_faq(faq)
+        self.assertEqual(result["decision"], "REJECT")
+
+    def test_reject_routing(self):
+        faq = {
+            "question_confidence": 0.9,
+            "answer_confidence": 0.9,
+            "relevance_score": 0.9,
+            "completeness_score": 0.9,
+            "redundancy_score": 0.1,
+            "pii_removed": True,
+            "routing_flag": True,
+        }
+        result = self.scorer.score_faq(faq)
+        self.assertEqual(result["decision"], "REJECT")
+
+    def test_reject_low_worthiness(self):
+        faq = {
+            "question_confidence": 0.9,
+            "answer_confidence": 0.9,
+            "relevance_score": 0.9,
+            "completeness_score": 0.9,
+            "redundancy_score": 0.1,
+            "pii_removed": True,
+            "faq_worthiness": 0.2,
+        }
+        result = self.scorer.score_faq(faq)
+        self.assertEqual(result["decision"], "REJECT")
+
 
 if __name__ == "__main__":
     unittest.main()
