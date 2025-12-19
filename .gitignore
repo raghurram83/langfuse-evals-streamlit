@@ -1,5 +1,9 @@
 .streamlit/secrets.toml
 venv
 venv312
+.venv
+indent-discoverer/
+data/
 __pycache__
 *.pyc
+evals_generator/.session_cache.json

@@ -1,581 +1,419 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Any, Dict, Optional
 import os
-from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
 import streamlit as st
-from openai import OpenAI
+
+from config import DATA_DIR, EMBEDDING_MODEL, LLM_MODEL, OPENAI_API_KEY, load_json
+from pipeline.cache_io import clear_pipeline_cache, load_pipeline_result, save_pipeline_result
+from pipeline.runner import PipelineResult, run_pipeline
+from pipeline import step_01_ingestion
+from pipeline import step_02_ticketing_llm
+from pipeline import step_04_embeddings
+from pipeline import step_05_similarity_grouping
+from pipeline import step_06_labeling_llm
+from pipeline import step_07_compression
+from pipeline import step_08_flow_viability
 
 
-MODEL_NAME = "gpt-4.1-mini"
-
-ANALYSIS_PROMPT = """You are an Intent & Use-Case Discovery Engine for a SaaS product.
-
-You will be given:
-
-A raw conversation dump as a single text blob (calls + WhatsApp).
-Each line may contain messages from customers and agents.
-Conversations may be separated by blank lines or system markers.
-Your job is to:
-
-Discover the top 5–10 customer intents.
-Give real examples for each intent.
-Suggest Day-1 bot flows for each intent.
-Generate simple bot-flow drafts in structured JSON.
-You MUST follow the OUTPUT JSON SCHEMA exactly (see bottom).
-
-HIGH-LEVEL TASK
-From the conversation dump, focus ONLY on what customers want (their questions, requests, problems, objections, and tasks).
-
-Identify recurring customer problems / requests.
-
-Cluster them into intents.
-
-Select the top intents by frequency (aim for 5–10).
-
-For each top intent:
-
-Give it a short, clear name (e.g., "Pricing Query", "Demo Request", "Order Status", "Refund").
-Estimate its share of total conversations as a percentage.
-Extract real example utterances as they appear in the text.
-Suggest a Day-1 bot flow (step-by-step).
-Generate a bot_flow_draft that is ready to be mapped into a Composer-style flow later.
-If data is noisy, mixed, or sparse, still do your best and explain any limitations in the analysis_notes field.
-
-HOW TO THINK ABOUT INTENTS
-Definition of an intent:
-
-A customer goal you can summarise as “The user is trying to ___”.
-Examples: ask price, book a demo, check order status, cancel, change plan, get support, etc.
-Rules:
-
-Merge similar phrasings into one intent.
-Prefer fewer, clearer intents over many tiny ones.
-Ignore one-off or extremely rare requests for the MVP (long-tail).
-OUTPUT FORMAT (IMPORTANT)
-You MUST return a single JSON object using this schema:
-
-{
-"summary": {
-"total_conversations_estimate": number,
-"total_customer_messages_estimate": number,
-"high_level_overview": string
-},
-"intents": [
-{
-"intent_id": string,
-"display_name": string,
-"description": string,
-"volume_percent_estimate": number,
-"example_utterances": [string, ...],
-"sample_conversations": [
-{
-"short_id": string,
-"snippet": string,
-"reason_why_this_intent": string
-}
-],
-"recommended_flow": {
-"goal": string,
-"when_to_trigger": string,
-"steps": [
-{
-"step_order": number,
-"type": "ask" | "inform" | "confirm" | "handover",
-"message_template": string,
-"variable_key": string | null,
-"notes": string | null
-}
-]
-},
-"bot_flow_draft": {
-"flow_name": string,
-"entry_condition": string,
-"steps": [
-{
-"step_id": string,
-"step_order": number,
-"type": "ask" | "inform" | "confirm" | "handover",
-"message_template": string,
-"capture_variable": string | null,
-"validation_hint": string | null,
-"next_step_if_success": string | null,
-"next_step_if_failure": string | null
-}
-],
-"handover_rules": [
-{
-"reason": string,
-"condition_description": string
-}
-]
-}
-}
-],
-"analysis_notes": string
-}
-
-IMPORTANT BEHAVIOUR RULES
-DO NOT invent product features or policies not implied by the dump.
-Stay grounded in what customers actually asked.
-Prefer simple English.
-Always return valid JSON. No markdown, no extra text.
-CALL PATTERN:
-system: this prompt
-user: a JSON string like { "conversation_dump": "<RAW_TEXT>" }
-Return only the JSON object.
-END ANALYSIS PROMPT"""
+st.set_page_config(page_title="Intent & Flow Discovery Validator", layout="wide")
 
 
-def parse_uploaded_file(uploaded_file: Any) -> Tuple[Optional[str], Optional[str], Optional[List[Dict[str, Any]]], Optional[str]]:
-    """Return (conversation_dump_text, preview_text, preview_table, error_message)."""
-    try:
-        file_bytes = uploaded_file.read()
-    except Exception as exc:  # pragma: no cover - UI surfaced error
-        return None, None, None, f"Failed to read file: {exc}"
-
-    suffix = uploaded_file.name.lower().rsplit(".", 1)
-    ext = suffix[1] if len(suffix) == 2 else ""
-    size_kb = len(file_bytes) / 1024
-
-    if ext == "txt":
-        conversation_text = file_bytes.decode("utf-8", errors="ignore")
-        preview_lines = "\n".join(conversation_text.splitlines()[:20])
-        return conversation_text, preview_lines, [{"type": "txt", "size_kb": f"{size_kb:.1f} KB"}], None
-
-    if ext == "json":
-        try:
-            raw_text = file_bytes.decode("utf-8", errors="ignore")
-            parsed = json.loads(raw_text)
-        except Exception as exc:  # pragma: no cover - UI surfaced error
-            return None, None, None, f"Failed to parse JSON: {exc}"
-
-        # Shape 1: dict with conversations
-        if isinstance(parsed, dict) and isinstance(parsed.get("conversations"), list):
-            convs = parsed["conversations"]
-            preview_rows = []
-            blocks: List[str] = []
-            for conv in convs:
-                if not isinstance(conv, dict):
-                    continue
-                conv_id = conv.get("conversation_id", "unknown")
-                channel = conv.get("channel", "unknown")
-                messages = conv.get("messages") if isinstance(conv.get("messages"), list) else []
-                preview_rows.append(
-                    {
-                        "conversation_id": conv_id,
-                        "channel": channel,
-                        "#messages": len(messages),
-                    }
-                )
-                lines = []
-                for msg in messages:
-                    if not isinstance(msg, dict):
-                        continue
-                    sender = str(msg.get("sender", "") or "Speaker").capitalize()
-                    text = str(msg.get("text", "") or "").strip()
-                    if text:
-                        lines.append(f"{sender}: {text}")
-                header = f"Conversation {conv_id} ({channel})"
-                blocks.append(header if not lines else f"{header}\n" + "\n".join(lines))
-            if not blocks:
-                return None, None, None, "No valid conversations/messages found in JSON."
-            conversation_text = "\n\n".join(blocks)
-            preview_dump = "\n".join(conversation_text.splitlines()[:30])
-            return conversation_text, preview_dump, preview_rows[:3], None
-
-        # Shape 2: list of call objects
-        if isinstance(parsed, list):
-            transcripts: List[str] = []
-            preview_rows: List[Dict[str, Any]] = []
-            for call in parsed:
-                if not isinstance(call, dict):
-                    continue
-                call_transcript = call.get("call_transcript")
-                if isinstance(call_transcript, str):
-                    transcripts.append(call_transcript)
-                preview_rows.append(
-                    {
-                        "call_id": call.get("call_id", ""),
-                        "caller": call.get("caller", ""),
-                        "agent_name": call.get("agent_name", ""),
-                        "start_time": call.get("start_time", ""),
-                    }
-                )
-            if not transcripts:
-                return None, None, None, "No call_transcript fields found in JSON."
-            conversation_text = "\n\n".join(transcripts)
-            preview_dump = "\n".join(conversation_text.splitlines()[:30])
-            return conversation_text, preview_dump, preview_rows[:3], None
-
-        return None, None, None, "Unsupported JSON shape. Provide the unified schema or an array of call objects."
-
-    return None, None, None, "Unsupported file type. Please upload a .txt or .json file."
+def save_uploaded_conversations(uploaded_file: Optional[Any]) -> Optional[Path]:
+    if uploaded_file is None:
+        return None
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    target = DATA_DIR / "_uploaded_conversations.json"
+    target.write_bytes(uploaded_file.getvalue())
+    return target
 
 
-def run_intent_discovery(conversation_text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
-    """Call the OpenAI API and return parsed JSON, raw text, and error message if any."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return None, None, "OPENAI_API_KEY environment variable is not set."
-
-    client = OpenAI(api_key=api_key)
-
-    try:
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": ANALYSIS_PROMPT},
-                {"role": "user", "content": json.dumps({"conversation_dump": conversation_text})},
-            ],
+def format_usage_table(usage: Dict[str, Dict[str, int]]) -> pd.DataFrame:
+    rows = []
+    for step, stats in usage.items():
+        if not isinstance(stats, dict):
+            continue
+        has_token_keys = any(key in stats for key in ["prompt_tokens", "completion_tokens", "total_tokens"])
+        if not has_token_keys:
+            continue
+        rows.append(
+            {
+                "step": step,
+                "prompt_tokens": stats.get("prompt_tokens", 0),
+                "completion_tokens": stats.get("completion_tokens", 0),
+                "total_tokens": stats.get("total_tokens", 0),
+            }
         )
-    except Exception as exc:  # pragma: no cover - UI surfaced error
-        return None, None, f"Error calling OpenAI API: {exc}"
-
-    raw_text = ""
-    if completion.choices:
-        message = completion.choices[0].message
-        raw_text = (message.content or "").strip()
-
-    if not raw_text:
-        return None, None, "Empty response from model."
-
-    try:
-        parsed = json.loads(raw_text)
-        return parsed, raw_text, None
-    except json.JSONDecodeError:
-        return None, raw_text, "Model response could not be parsed as JSON."
+    return pd.DataFrame(rows)
 
 
-def render_summary(summary: Dict[str, Any]) -> None:
-    st.subheader("Summary")
-    total_conversations = summary.get("total_conversations_estimate", "—")
-    total_messages = summary.get("total_customer_messages_estimate", "—")
-    high_level_overview = summary.get("high_level_overview", "")
+def render_overview(result: PipelineResult) -> None:
+    st.markdown("### Overview")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Conversations", len(result.conversations))
+    col2.metric("Tickets", len(result.tickets))
+    col3.metric("Similarity groups", result.grouped_tickets["similarity_group_id"].nunique())
+    col4.metric("Compressed flows", len(result.flows))
+
+    st.caption("Pipeline: Ingest → Ticket (LLM per conversation) → Embed → Similarity (analysis only) → Single-call flow labeling → Compression (≤20 flows) → Flow viability → Rank")
+
+    st.markdown("#### Models")
+    st.write(f"LLM model: `{result.llm_model}` • Embedding model: `{result.embedding_model}`")
+
+    sim_metrics = result.usage.get("similarity_metrics", {})
+    if sim_metrics:
+        st.write(
+            f"Similarity metrics (for audit, not intent): avg={sim_metrics.get('avg_similarity', 0):.2f}, "
+            f"max={sim_metrics.get('max_similarity', 0):.2f}"
+        )
+
+    st.markdown("#### Token usage")
+    usage_table = format_usage_table(result.usage)
+    if not usage_table.empty:
+        st.dataframe(usage_table, use_container_width=True)
+    else:
+        st.write("No token usage captured yet.")
+
+
+def render_step_inspector(result: PipelineResult) -> None:
+    st.markdown("### Step-by-Step Inspector")
+    steps: Dict[str, pd.DataFrame] = {
+        "1. Conversation ingestion": result.conversations,
+        "2. Ticket extraction (LLM per conversation)": result.tickets,
+        "3. Ticket embeddings (cached)": result.embedded_tickets,
+        "4. Similarity grouping (analysis only)": result.grouped_tickets,
+        "5. Single-call flow labeling per ticket": result.labeled_tickets,
+        "6. Compression (<=20 flows)": result.compressed_tickets,
+        "7. Flow viability + ranking": result.flows,
+    }
+
+    step_names = list(steps.keys())
+    selected = st.selectbox("Select a step to inspect", step_names, index=1 if len(step_names) > 1 else 0)
+    st.write("Inputs → Outputs")
+    if "Similarity grouping" in selected:
+        st.warning("Similarity ≠ Intent. Groups are only for nearest-neighbor review.")
+    df = steps[selected]
+    if not df.empty:
+        st.dataframe(df.head(20), use_container_width=True)
+    else:
+        st.write("No data for this step yet.")
+
+    st.divider()
+    st.markdown("**Track a ticket end-to-end**")
+    ticket_ids = result.labeled_tickets["ticket_id"].tolist()
+    if ticket_ids:
+        selected_ticket = st.selectbox("Ticket", ticket_ids)
+        trace = {
+            "ticket": result.tickets[result.tickets["ticket_id"] == selected_ticket].to_dict("records"),
+            "label": result.labeled_tickets[result.labeled_tickets["ticket_id"] == selected_ticket].to_dict("records"),
+        }
+        for label, rows in trace.items():
+            st.markdown(f"**{label.capitalize()}**")
+            st.json(rows[0] if rows else {})
+    else:
+        st.write("No tickets to trace.")
+
+
+def render_tickets_tab(result: PipelineResult) -> None:
+    st.markdown("### Tickets")
+    df = result.labeled_tickets.copy()
+    flow_options = sorted(df["proposed_flow"].unique())
+    category_options = sorted(df["category"].unique())
 
     col1, col2 = st.columns(2)
-    col1.metric("Total conversations (est.)", total_conversations)
-    col2.metric("Customer messages (est.)", total_messages)
-    if high_level_overview:
-        st.write(high_level_overview)
+    selected_flows = col1.multiselect("Flow filter", flow_options, default=flow_options)
+    selected_cats = col2.multiselect("Category filter", category_options, default=category_options)
 
-
-def render_recommended_flow(flow: Dict[str, Any]) -> None:
-    st.markdown("**Recommended Day-1 Flow**")
-    goal = flow.get("goal")
-    trigger = flow.get("when_to_trigger")
-    if goal or trigger:
-        st.write(f"Goal: {goal or '—'}")
-        st.write(f"When to trigger: {trigger or '—'}")
-
-    steps = flow.get("steps") or []
-    if steps:
-        rows = []
-        for step in steps:
-            rows.append(
-                {
-                    "Order": step.get("step_order"),
-                    "Type": step.get("type"),
-                    "Message": step.get("message_template"),
-                    "Variable": step.get("variable_key"),
-                    "Notes": step.get("notes"),
-                }
-            )
-        st.table(rows)
-    else:
-        st.write("No recommended flow steps provided.")
-
-
-def render_bot_flow(bot_flow: Dict[str, Any]) -> None:
-    st.markdown("**Bot Flow Draft**")
-    st.write(f"Flow name: {bot_flow.get('flow_name', '—')}")
-    st.write(f"Entry condition: {bot_flow.get('entry_condition', '—')}")
-
-    steps = bot_flow.get("steps") or []
-    if steps:
-        rows = []
-        for step in steps:
-            rows.append(
-                {
-                    "Step ID": step.get("step_id"),
-                    "Order": step.get("step_order"),
-                    "Type": step.get("type"),
-                    "Message": step.get("message_template"),
-                    "Capture": step.get("capture_variable"),
-                    "Validation": step.get("validation_hint"),
-                    "Next if success": step.get("next_step_if_success"),
-                    "Next if failure": step.get("next_step_if_failure"),
-                }
-            )
-        st.table(rows)
-    else:
-        st.write("No bot flow steps provided.")
-
-    handover_rules = bot_flow.get("handover_rules") or []
-    if handover_rules:
-        st.markdown("**Handover rules:**")
-        for rule in handover_rules:
-            reason = rule.get("reason", "Reason not provided")
-            condition = rule.get("condition_description", "Condition not provided")
-            st.markdown(f"- {reason}: {condition}")
-
-
-def render_intents(intents: List[Dict[str, Any]]) -> None:
-    def is_non_english(text: str) -> bool:
-        ascii_ratio = sum(1 for ch in text if ord(ch) < 128) / max(len(text), 1)
-        return ascii_ratio < 0.85
-
-    def translate_text(text: str) -> Optional[str]:
-        cache = st.session_state.setdefault("translation_cache", {})
-        if text in cache:
-            return cache[text]
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            return None
-        client = OpenAI(api_key=api_key)
-        try:
-            resp = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": "Translate the user message to concise English. Return only the translation."},
-                    {"role": "user", "content": text},
-                ],
-                max_tokens=120,
-            )
-            translation = (resp.choices[0].message.content or "").strip()
-            cache[text] = translation
-            return translation
-        except Exception:
-            return None
-
-    st.subheader("Intent Catalogue")
-    for intent in intents:
-        display_name = intent.get("display_name", "Unknown intent")
-        volume = intent.get("volume_percent_estimate")
-        expander_title = f"Intent: {display_name}"
-        if volume is not None:
-            expander_title += f" (≈ {volume}% of conversations)"
-
-        with st.expander(expander_title, expanded=False):
-            st.markdown(f"**Intent ID:** {intent.get('intent_id', '—')}")
-            st.write(intent.get("description", ""))
-
-            examples = intent.get("example_utterances") or []
-            if examples:
-                st.markdown("**Example utterances:**")
-                for utt in examples:
-                    st.markdown(f"- {utt}")
-                    if is_non_english(utt):
-                        translated = translate_text(utt)
-                        if translated:
-                            st.markdown(
-                                f"<div style='color:#6a5acd;font-style:italic;margin-left:12px;'>↪ {translated}</div>",
-                                unsafe_allow_html=True,
-                            )
-
-            samples = intent.get("sample_conversations") or []
-            if samples:
-                st.markdown("**Sample conversations:**")
-                for sample in samples:
-                    snippet = sample.get("snippet", "")
-                    st.markdown(f"- `{sample.get('short_id', 'sample')}`: {snippet}")
-                    if is_non_english(snippet):
-                        translated = translate_text(snippet)
-                        if translated:
-                            st.markdown(
-                                f"<div style='color:#6a5acd;font-style:italic;margin-left:12px;'>↪ {translated}</div>",
-                                unsafe_allow_html=True,
-                            )
-                    reason = sample.get("reason_why_this_intent")
-                    if reason:
-                        st.markdown(f"  - Why: {reason}")
-
-            recommended_flow = intent.get("recommended_flow") or {}
-            render_recommended_flow(recommended_flow)
-
-            bot_flow = intent.get("bot_flow_draft") or {}
-            render_bot_flow(bot_flow)
-
-
-def render_pipeline_steps(result_json: Dict[str, Any]) -> None:
-    intents = result_json.get("intents") or []
-    st.subheader("Pipeline Steps")
-
-    def render_intent_table() -> None:
-        rows = []
-        for intent in intents:
-            rows.append(
-                {
-                    "Intent": intent.get("display_name", intent.get("intent_id", "")),
-                    "Intent ID": intent.get("intent_id", ""),
-                    "Volume %": intent.get("volume_percent_estimate"),
-                }
-            )
-        if rows:
-            st.table(rows)
-        else:
-            st.write("No intents found.")
-
-    def render_examples() -> None:
-        for intent in intents:
-            examples = intent.get("example_utterances") or []
-            if not examples:
-                continue
-            st.markdown(f"- **{intent.get('display_name', intent.get('intent_id', 'Intent'))}**")
-            for utt in examples:
-                st.markdown(f"  - {utt}")
-
-    def render_recommended_flows() -> None:
-        for intent in intents:
-            flow = intent.get("recommended_flow") or {}
-            st.markdown(f"**{intent.get('display_name', intent.get('intent_id', 'Intent'))}**")
-            st.write(f"Goal: {flow.get('goal', '—')}")
-            steps = flow.get("steps") or []
-            if steps:
-                rows = []
-                for step in steps:
-                    rows.append(
-                        {
-                            "Order": step.get("step_order"),
-                            "Type": step.get("type"),
-                            "Message": step.get("message_template"),
-                        }
-                    )
-                st.table(rows)
-            else:
-                st.write("No steps provided.")
-
-    def render_bot_flows() -> None:
-        for intent in intents:
-            bot_flow = intent.get("bot_flow_draft") or {}
-            st.markdown(f"**{intent.get('display_name', intent.get('intent_id', 'Intent'))}**")
-            st.write(f"Flow name: {bot_flow.get('flow_name', '—')}")
-            steps = bot_flow.get("steps") or []
-            if steps:
-                rows = []
-                for step in steps:
-                    rows.append(
-                        {
-                            "Step ID": step.get("step_id"),
-                            "Type": step.get("type"),
-                            "Message": step.get("message_template"),
-                        }
-                    )
-                st.table(rows)
-            else:
-                st.write("No bot flow steps provided.")
-
-    step_items = [
-        ("Intent Discovery", render_intent_table),
-        ("Example Extraction", render_examples),
-        ("Use-Case & Flow Suggestion", render_recommended_flows),
-        ("Bot Flow Generator", render_bot_flows),
+    filtered = df[
+        df["proposed_flow"].isin(selected_flows)
+        & df["category"].isin(selected_cats)
     ]
 
-    for idx, (title, renderer) in enumerate(step_items, start=1):
-        with st.expander(f"{idx}. {title} ✅", expanded=False):
-            renderer()
+    st.dataframe(
+        filtered[
+            [
+                "ticket_id",
+                "conversation_id",
+                "ticket_text",
+                "proposed_flow",
+                "confidence",
+                "category",
+            ]
+        ],
+        use_container_width=True,
+    )
+
+    st.markdown("**Inspect ticket**")
+    if not filtered.empty:
+        selected_ticket = st.selectbox("Ticket to inspect", filtered["ticket_id"].tolist())
+        ticket_row = result.labeled_tickets[result.labeled_tickets["ticket_id"] == selected_ticket].iloc[0]
+        st.write(f"Ticket: {ticket_row.ticket_text}")
+        st.write(f"Proposed flow: {ticket_row.get('proposed_flow', '')}")
+        st.write(f"Reasoning: {ticket_row.get('reasoning', '')}")
+        st.write(f"Confidence: {ticket_row.get('confidence', 0):.2f}")
+        st.write(f"Category: {ticket_row.get('category', '')}")
+    else:
+        st.write("No tickets after filter.")
 
 
-def render_results(result_json: Dict[str, Any]) -> None:
-    summary = result_json.get("summary")
-    if isinstance(summary, dict):
-        render_summary(summary)
+def render_intents_and_flows(result: PipelineResult, taxonomy_lookup: Dict[str, str]) -> None:
+    st.markdown("### Flows (compressed)")
+    df = result.flows.copy()
+    if df.empty:
+        st.write("No flows mapped yet.")
+        return
 
-    intents = result_json.get("intents") or []
-    if intents:
-        render_intents(intents)
+    def split_category(flow_name: str) -> tuple[str, str]:
+        if "." in flow_name:
+            cat, rest = flow_name.split(".", 1)
+            return cat, rest
+        return "uncategorized", flow_name
 
-    render_pipeline_steps(result_json)
+    # Group by category prefix (topic)
+    df[["category_topic", "subcategory"]] = df["compressed_flow"].apply(
+        lambda x: pd.Series(split_category(str(x)))
+    )
 
-    analysis_notes = result_json.get("analysis_notes")
-    if analysis_notes:
-        st.subheader("Analysis Notes")
-        st.write(analysis_notes)
+    st.markdown("#### Topics → Flows")
+    for topic, topic_df in df.groupby("category_topic"):
+        with st.expander(f"Topic: {topic} ({len(topic_df)} flows)", expanded=False):
+            for _, row in topic_df.iterrows():
+                sub = row["subcategory"]
+                examples = row.get("example_tickets") or []
+                example_snippet = examples[0][:200] if examples else ""
+                desc = row.get("why") or ""
+                if desc:
+                    desc = desc.strip()
+                agent_steps = (row.get("agent_resolutions") or [])
+                agent_snippet = agent_steps[0] if agent_steps else ""
+                if agent_snippet:
+                    desc = f"Mirror agent handling: {agent_snippet}"
+                    if desc and desc[-1] != ".":
+                        desc += "."
+                elif example_snippet:
+                    desc = (
+                        f"Mirror agent handling: ask for needed details referenced in '{example_snippet}', "
+                        f"confirm, then execute the {sub} flow. {desc}"
+                    )
+                elif not desc:
+                    desc = f"Mirror agent handling: ask clarifying questions, confirm intent, then execute the {sub} flow."
+                st.markdown(
+                    f"**{sub}** — freq {row['frequency']}, avg_conf {row['avg_confidence']:.2f}, viability {row.get('viability','')}"
+                )
+                st.markdown(f"*What to do:* {desc}")
 
-    st.subheader("Raw JSON Result")
-    st.code(json.dumps(result_json, indent=2), language="json")
+    st.markdown("#### Top flows to build (exclude HUMAN_ONLY automatically)")
+    build_df = df[df["viability"] != "HUMAN_ONLY"]
+    st.dataframe(build_df[["compressed_flow", "frequency", "avg_confidence", "viability", "why"]])
+
     st.download_button(
-        label="Download JSON",
-        file_name="result.json",
-        mime="application/json",
-        data=json.dumps(result_json, indent=2),
+        "Export flows CSV",
+        data=df.to_csv(index=False),
+        file_name="flows_ranked.csv",
+        mime="text/csv",
     )
 
 
-def show_upload_preview(conversation_text: str, preview: Optional[str], preview_table: Optional[List[Dict[str, Any]]], uploaded_file: Any) -> None:
-    file_label = uploaded_file.type or "file"
-    size_kb = len(uploaded_file.getvalue()) / 1024 if hasattr(uploaded_file, "getvalue") else 0
-    st.info(f"Uploaded: {uploaded_file.name} • {file_label} • {size_kb:.1f} KB")
+def ensure_openai_key() -> bool:
+    if not (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY):
+        st.error("Set OPENAI_API_KEY environment variable or enter the key in the sidebar.")
+        return False
+    return True
 
-    if preview_table:
-        if "call_id" in preview_table[0]:
-            st.markdown("Preview of calls (first 3):")
-        else:
-            st.markdown("Preview of conversations (first 3):")
-        st.table(preview_table)
 
-    st.text_area(
-        "Conversation dump preview (first ~30 lines)",
-        preview or "\n".join(conversation_text.splitlines()[:30]),
-        height=360,
-        disabled=True,
+def run_step_ticketing(result: PipelineResult, conversations_path: Optional[str], llm_model: str, progress_callback=None) -> PipelineResult:
+    path_obj = Path(conversations_path) if conversations_path else DATA_DIR / "_uploaded_conversations.json"
+    conversations = step_01_ingestion.ingest_conversations(path_obj if path_obj.exists() else None)
+    tickets, ticket_usage = step_02_ticketing_llm.extract_tickets(conversations, model=llm_model, progress_callback=progress_callback)
+    result.conversations = conversations
+    result.tickets = tickets
+    result.usage["ticketing"] = ticket_usage
+    save_pipeline_result(result)
+    return result
+
+
+def run_step_embeddings(result: PipelineResult, embedding_model: str) -> PipelineResult:
+    if result.tickets.empty:
+        raise ValueError("No tickets available. Run ticketing first.")
+    embedded, embed_usage = step_04_embeddings.generate_ticket_embeddings(result.tickets, model=embedding_model)
+    grouped, sim_metrics = step_05_similarity_grouping.group_by_similarity(embedded) if not embedded.empty else (embedded, {})
+    result.embedded_tickets = embedded
+    result.grouped_tickets = grouped
+    result.usage["embeddings"] = embed_usage
+    result.usage["similarity_metrics"] = sim_metrics
+    save_pipeline_result(result)
+    return result
+
+
+def run_step_labeling(result: PipelineResult, llm_model: str, progress_callback=None) -> PipelineResult:
+    if result.embedded_tickets.empty:
+        raise ValueError("No embedded tickets available. Run embeddings first.")
+    taxonomy = load_json("taxonomy.json").get("intent_clusters", [])
+    registry = load_json("flow_registry.json").get("flows", [])
+    labeled, label_usage = step_06_labeling_llm.label_tickets(
+        result.embedded_tickets, taxonomy, registry, model=llm_model, batch_size=10, progress_callback=progress_callback
     )
+    result.labeled_tickets = labeled
+    result.usage["labeling"] = label_usage
+    save_pipeline_result(result)
+    return result
+
+
+def run_step_compression(result: PipelineResult, max_flows: int = 20, min_freq_ratio: float = 0.02) -> PipelineResult:
+    if result.labeled_tickets.empty:
+        raise ValueError("No labeled tickets available. Run labeling first.")
+    compressed = step_07_compression.compress_flows(result.labeled_tickets, max_flows=max_flows, min_frequency_ratio=min_freq_ratio)
+    result.compressed_tickets = compressed
+    save_pipeline_result(result)
+    return result
+
+
+def run_step_viability(result: PipelineResult, llm_model: str) -> PipelineResult:
+    if result.compressed_tickets.empty:
+        raise ValueError("No compressed tickets available. Run compression first.")
+    flow_rows = []
+    for flow_name, df_flow in result.compressed_tickets.groupby("compressed_flow"):
+        flow_rows.append(
+            {
+                "compressed_flow": flow_name,
+                "frequency": len(df_flow),
+                "avg_confidence": float(df_flow["confidence"].mean()) if len(df_flow) else 0.0,
+                "example_tickets": df_flow["ticket_text"].head(3).tolist(),
+                "category_counts": df_flow["category"].value_counts().to_dict(),
+                "agent_resolutions": df_flow["agent_resolution"].dropna().head(3).tolist(),
+            }
+        )
+    flow_df = pd.DataFrame(flow_rows)
+    flows_with_viability, viab_usage = step_08_flow_viability.score_flow_viability(flow_df, model=llm_model)
+    result.flows = flows_with_viability
+    result.usage["viability"] = viab_usage
+    save_pipeline_result(result)
+    return result
 
 
 def main() -> None:
-    st.set_page_config(page_title="Intent & Use-Case Discovery PoC", layout="wide")
-    st.title("Intent & Use-Case Discovery PoC")
-    st.write(
-        "Upload a conversation dump (.txt or .json). The system will analyze customer intents, "
-        "show top intents with examples, and generate draft bot flows."
-    )
+    st.title("Intent & Flow Discovery Validator")
+    st.write("Validates real intent extraction and flow mapping for chatbot build readiness.")
 
-    uploaded_file = st.file_uploader("Upload conversation dump (.txt or .json)", type=["txt", "json"])
-    conversation_text: Optional[str] = None
-    preview_text: Optional[str] = None
-    preview_table: Optional[List[Dict[str, Any]]] = None
-    parse_error: Optional[str] = None
+    taxonomy = load_json("taxonomy.json")["intent_clusters"]
+    taxonomy_lookup = {item["intent_id"]: item["name"] for item in taxonomy}
 
-    if uploaded_file is not None:
-        conversation_text, preview_text, preview_table, parse_error = parse_uploaded_file(uploaded_file)
-        if parse_error:
-            st.error(parse_error)
-        else:
-            show_upload_preview(conversation_text, preview_text, preview_table, uploaded_file)
+    with st.sidebar:
+        st.subheader("Run pipeline")
+        st.caption("Uses real embeddings and chat completions. No mocks.")
+        uploaded_file = st.file_uploader("Optional conversations JSON", type=["json"])
+        uploaded_path = save_uploaded_conversations(uploaded_file) if uploaded_file else None
+        sample_count = st.number_input(
+            "Limit # conversations (0 = all)",
+            min_value=0,
+            step=1,
+            value=0,
+            help="Useful for large dumps. Applies to uploaded file or default data.",
+        )
+        api_key_input = st.text_input(
+            "OpenAI API key",
+            type="password",
+            value=os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY or "",
+            help="Overrides env var for this run.",
+        )
+        llm_model_input = st.text_input("LLM model", value=os.getenv("LLM_MODEL") or LLM_MODEL, help="Chat completion model")
+        embedding_model_input = st.text_input(
+            "Embedding model", value=os.getenv("EMBEDDING_MODEL") or EMBEDDING_MODEL, help="Embedding model for similarity"
+        )
+        step_option = st.selectbox(
+            "Step to run",
+            ["all", "ticketing", "embeddings", "labeling", "compression", "viability"],
+            help="Run a single step or the full pipeline.",
+        )
+        if st.button("Clear data"):
+            st.session_state["pending_clear"] = True
+        if st.session_state.get("pending_clear"):
+            st.warning("Confirm clearing cached results?")
+            colc1, colc2 = st.columns(2)
+            if colc1.button("Confirm clear", type="secondary"):
+                st.session_state.pop("pipeline_result", None)
+                clear_pipeline_cache()
+                st.session_state["pending_clear"] = False
+            if colc2.button("Cancel", type="secondary"):
+                st.session_state["pending_clear"] = False
+        run_clicked = st.button("Run selected", type="primary")
+        st.write(f"Default LLM: `{LLM_MODEL}`")
+        st.write(f"Default embedding: `{EMBEDDING_MODEL}`")
 
-    run_clicked = st.button("Run Intent Discovery", type="primary")
+    progress_bar = st.empty()
+    progress_text = st.empty()
 
     if run_clicked:
-        if parse_error:
-            st.error(parse_error)
-            return
+        if api_key_input:
+            os.environ["OPENAI_API_KEY"] = api_key_input
+        if ensure_openai_key():
+            def progress_callback(fraction: float, message: str) -> None:
+                capped = min(max(fraction, 0.0), 1.0)
+                progress_bar.progress(capped)
+                progress_text.write(message)
 
-        if not uploaded_file or not conversation_text:
-            st.error("Please upload a .txt or .json conversation dump first.")
-            return
+            with st.spinner(f"Running step: {step_option}..."):
+                try:
+                    if step_option == "all":
+                        result = run_pipeline(
+                            conversation_path=str(uploaded_path) if uploaded_path else None,
+                            llm_model=llm_model_input.strip() or None,
+                            embedding_model=embedding_model_input.strip() or None,
+                            sample_count=int(sample_count) if sample_count else None,
+                            progress_callback=progress_callback,
+                        )
+                    else:
+                        existing = st.session_state.get("pipeline_result") or load_pipeline_result() or PipelineResult(
+                            conversations=pd.DataFrame(),
+                            tickets=pd.DataFrame(),
+                            embedded_tickets=pd.DataFrame(),
+                            grouped_tickets=pd.DataFrame(),
+                            labeled_tickets=pd.DataFrame(),
+                            compressed_tickets=pd.DataFrame(),
+                            flows=pd.DataFrame(),
+                            usage={},
+                            llm_model=llm_model_input,
+                            embedding_model=embedding_model_input,
+                        )
+                        if step_option == "ticketing":
+                            result = run_step_ticketing(existing, str(uploaded_path) if uploaded_path else None, llm_model_input, progress_callback)
+                        elif step_option == "embeddings":
+                            result = run_step_embeddings(existing, embedding_model_input)
+                        elif step_option == "labeling":
+                            result = run_step_labeling(existing, llm_model_input, progress_callback)
+                        elif step_option == "compression":
+                            result = run_step_compression(existing)
+                        elif step_option == "viability":
+                            result = run_step_viability(existing, llm_model_input)
+                        else:
+                            result = existing
+                    st.session_state["pipeline_result"] = result
+                    save_pipeline_result(result)
+                except Exception as exc:  # pragma: no cover - surfaced in UI
+                    st.error(f"Pipeline failed: {exc}")
 
-        if not os.environ.get("OPENAI_API_KEY"):
-            st.error("OPENAI_API_KEY environment variable is not set.")
-            return
+    if "pipeline_result" not in st.session_state:
+        cached = load_pipeline_result()
+        if cached is not None:
+            st.session_state["pipeline_result"] = cached
 
-        with st.spinner("Analyzing conversation dump..."):
-            result_json, raw_text, error_message = run_intent_discovery(conversation_text)
-
-        if error_message:
-            st.error(error_message)
-            if raw_text:
-                with st.expander("Raw model response"):
-                    st.code(raw_text)
-            return
-
-        if result_json:
-            st.session_state.discovery_result = result_json
-
-    discovery_result = st.session_state.get("discovery_result")
-    if discovery_result:
-        render_results(discovery_result)
+    result: Optional[PipelineResult] = st.session_state.get("pipeline_result")
+    if result:
+        tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Step-by-Step", "Tickets", "Intents & Flows"])
+        with tab1:
+            render_overview(result)
+        with tab2:
+            render_step_inspector(result)
+        with tab3:
+            render_tickets_tab(result)
+        with tab4:
+            render_intents_and_flows(result, taxonomy_lookup)
+    else:
+        st.info("Upload conversations (optional) and run the pipeline to inspect outputs.")
 
 
 if __name__ == "__main__":

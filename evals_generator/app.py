@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import sys
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -93,7 +94,10 @@ def init_state() -> None:
                     "actual_output",
                     "expected_type",
                     "actual_type",
+                    "expected_type_counts",
+                    "actual_type_counts",
                     "type_match",
+                    "type_match_score",
                     "generation_info",
                     "judge_score",
                     "judge_reasoning",
@@ -121,7 +125,10 @@ def ensure_dataset_columns(df: pd.DataFrame) -> pd.DataFrame:
         "actual_output": "",
         "expected_type": "",
         "actual_type": "",
+        "expected_type_counts": "",
+        "actual_type_counts": "",
         "type_match": np.nan,
+        "type_match_score": np.nan,
         "generation_info": "",
         "judge_score": np.nan,
         "judge_reasoning": "",
@@ -157,68 +164,133 @@ def restore_actual_outputs_if_missing() -> None:
 
 
 # ----- Type helpers -----
-def extract_primary_message_type(payload: Any) -> str:
-    """
-    Pull out the first message type from a nested payload.
-    Supports both legacy {"messages": [...]} and WhatsAppUnifiedMessageSequence structures.
-    """
-    def _coerce(obj: Any) -> Any:
-        if isinstance(obj, str):
-            try:
-                return json.loads(obj)
-            except Exception:
-                return obj
-        return obj
+def _coerce_json(obj: Any) -> Any:
+    if isinstance(obj, str):
+        try:
+            return json.loads(obj)
+        except Exception:
+            return obj
+    return obj
 
-    def _find_messages(obj: Any) -> Optional[List[Any]]:
-        obj = _coerce(obj)
-        if isinstance(obj, dict):
-            if isinstance(obj.get("messages"), list):
-                return obj["messages"]
-            if "WhatsAppUnifiedMessageSequence" in obj:
-                seq = obj.get("WhatsAppUnifiedMessageSequence", {})
-                if isinstance(seq, dict) and isinstance(seq.get("messages"), list):
-                    return seq["messages"]
-            if "output" in obj:
-                msgs = _find_messages(obj["output"])
-                if msgs:
-                    return msgs
-            for val in obj.values():
-                if isinstance(val, (dict, list)):
-                    msgs = _find_messages(val)
-                    if msgs:
-                        return msgs
-        if isinstance(obj, list):
-            for item in obj:
-                msgs = _find_messages(item)
-                if msgs:
-                    return msgs
-        return None
 
-    messages = _find_messages(payload)
-    if not messages:
-        return ""
+def _collect_messages(obj: Any) -> List[Any]:
+    obj = _coerce_json(obj)
+    messages: List[Any] = []
+    if isinstance(obj, dict):
+        if isinstance(obj.get("messages"), list):
+            return obj["messages"]
+        if "WhatsAppUnifiedMessageSequence" in obj:
+            seq = obj.get("WhatsAppUnifiedMessageSequence", {})
+            if isinstance(seq, dict) and isinstance(seq.get("messages"), list):
+                return seq["messages"]
+        # Dive into nested structures.
+        for val in obj.values():
+            if isinstance(val, (dict, list)):
+                messages.extend(_collect_messages(val))
+    elif isinstance(obj, list):
+        for item in obj:
+            messages.extend(_collect_messages(item))
+    return messages
+
+
+def extract_message_type_counts(payload: Any) -> Counter:
+    """
+    Return a Counter of message types across the payload.
+    Handles WhatsAppUnifiedMessageSequence and aggregated media+text messages.
+    """
+    counts: Counter = Counter()
+    messages = _collect_messages(payload)
     for msg in messages:
         if not isinstance(msg, dict):
             continue
-        msg_type = msg.get("message_type") or msg.get("type")
-        if isinstance(msg_type, str) and msg_type.strip():
-            return msg_type.strip()
-    return ""
+        msg_type = msg.get("message_type") or msg.get("type") or ""
+        msg_type = msg_type.strip() if isinstance(msg_type, str) else ""
+
+        # Heuristic: detect embedded text/media in media messages with candidates.
+        text_obj = msg.get("text") if isinstance(msg.get("text"), dict) else {}
+        media_candidates = msg.get("media_candidates") if isinstance(msg.get("media_candidates"), list) else []
+
+        if msg_type == "media":
+            if text_obj.get("body"):
+                counts["text"] += 1
+            if media_candidates:
+                counts["media"] += len(media_candidates)
+            else:
+                counts["media"] += 1
+            continue
+
+        if msg_type:
+            counts[msg_type] += 1
+            # If it's a text message with an explicit body, count once.
+            if msg_type == "text" and text_obj.get("body"):
+                counts["text"] += 0  # already counted
+            continue
+
+        # Fallback: infer from nested structures if type missing.
+        content = msg.get("content") if isinstance(msg.get("content"), dict) else {}
+        if content.get("buttons"):
+            counts["interactive_buttons"] += 1
+        elif content.get("sections"):
+            counts["interactive_list"] += 1
+        elif content.get("media_link"):
+            counts["media"] += 1
+        elif content.get("body"):
+            counts["text"] += 1
+
+    return counts
+
+
+def extract_primary_message_type(payload: Any) -> str:
+    """Return the most frequent message type from the payload, or empty string if none found."""
+    try:
+        counts = extract_message_type_counts(payload)
+        if not counts:
+            return ""
+        return counts.most_common(1)[0][0]
+    except Exception:
+        return ""
+
+
+def summarize_counts(counter: Counter) -> str:
+    if not counter:
+        return ""
+    parts = [f"{k}:{v}" for k, v in counter.items()]
+    return ", ".join(parts)
 
 
 def update_type_comparisons(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute expected/actual types and a type_match flag."""
+    """Compute expected/actual type coverage, match flag, and match score."""
     df = ensure_dataset_columns(df.copy())
-    df["expected_type"] = df["expected_output"].apply(extract_primary_message_type)
-    df["actual_type"] = df["actual_output"].apply(extract_primary_message_type)
 
+    expected_counts = df["expected_output"].apply(extract_message_type_counts)
+    actual_counts = df["actual_output"].apply(extract_message_type_counts)
+
+    primary_expected = [next(iter(cnt)) if cnt else "" for cnt in expected_counts]
+    primary_actual = [next(iter(cnt)) if cnt else "" for cnt in actual_counts]
+
+    scores: List[Any] = []
     matches: List[Any] = []
-    for exp, act in zip(df["expected_type"], df["actual_type"]):
-        if not exp or not act:
+    expected_summaries: List[str] = []
+    actual_summaries: List[str] = []
+
+    for exp_cnt, act_cnt in zip(expected_counts, actual_counts):
+        expected_summaries.append(summarize_counts(exp_cnt))
+        actual_summaries.append(summarize_counts(act_cnt))
+        total_expected = sum(exp_cnt.values())
+        if total_expected == 0 or not act_cnt:
+            scores.append(np.nan)
             matches.append(np.nan)
-        else:
-            matches.append(bool(exp == act))
+            continue
+        overlap = sum(min(exp_cnt[t], act_cnt.get(t, 0)) for t in exp_cnt)
+        score = overlap / total_expected if total_expected > 0 else np.nan
+        scores.append(score)
+        matches.append(bool(score == 1.0))
+
+    df["expected_type"] = primary_expected
+    df["actual_type"] = primary_actual
+    df["expected_type_counts"] = expected_summaries
+    df["actual_type_counts"] = actual_summaries
+    df["type_match_score"] = scores
     df["type_match"] = matches
     return df
 
@@ -398,22 +470,19 @@ def run_judge_on_rows(
 
 # ----- Styling and reporting -----
 def style_dataset_df(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
-    """Apply color coding based on type_match first, then judge_score."""
+    """Apply color coding based on type_match_score buckets (red→green)."""
     def color_row(row: pd.Series) -> List[str]:
-        type_match = row.get("type_match", np.nan)
-        if isinstance(type_match, bool):
-            color = "#e6f4ea" if type_match else "#fdecea"
-            return [f"background-color: {color}"] * len(row)
-
-        score = row.get("judge_score", np.nan)
+        score = row.get("type_match_score", np.nan)
         if pd.isna(score):
             return [""] * len(row)
-        if score >= 0.8:
-            color = "background-color: #d5f5e3"
-        elif score >= 0.5:
-            color = "background-color: #fcf3cf"
-        else:
-            color = "background-color: #f5b7b1"
+        if score == 1.0:
+            color = "background-color: #d4edda"
+        elif 0.5 < score < 1.0:
+            color = "background-color: #e9f7ef"
+        elif 0.0 < score <= 0.5:
+            color = "background-color: #fde2cf"
+        else:  # score == 0.0
+            color = "background-color: #f8d7da"
         return [color] * len(row)
 
     return df.style.apply(color_row, axis=1)
@@ -433,6 +502,8 @@ def compute_report_metrics(df: pd.DataFrame) -> Dict[str, Any]:
     red = (scores < 0.5).sum()
     exact_one = (scores == 1.0).sum()
     exact_zero = (scores == 0.0).sum()
+    low_non_zero = ((scores > 0.0) & (scores < 0.5)).sum()
+    mid_to_one = ((scores >= 0.5) & (scores < 1.0)).sum()
     exact_other = len(scores) - exact_one - exact_zero
     return {
         "count": len(scored),
@@ -445,6 +516,12 @@ def compute_report_metrics(df: pd.DataFrame) -> Dict[str, Any]:
         "exact_one": int(exact_one),
         "exact_zero": int(exact_zero),
         "exact_other": int(exact_other),
+        "low_non_zero": int(low_non_zero),
+        "mid_to_one": int(mid_to_one),
+        "pct_exact_one": float(exact_one / len(scores) * 100.0),
+        "pct_exact_zero": float(exact_zero / len(scores) * 100.0),
+        "pct_low_non_zero": float(low_non_zero / len(scores) * 100.0),
+        "pct_mid_to_one": float(mid_to_one / len(scores) * 100.0),
     }
 
 
@@ -452,30 +529,35 @@ def compute_type_mismatch_metrics(df: pd.DataFrame) -> Dict[str, Any]:
     """Summarize type alignment between expected_output and actual_output."""
     if df.empty:
         return {}
-    expected = df.get("expected_type", pd.Series(dtype=str)).fillna("").astype(str)
-    actual = df.get("actual_type", pd.Series(dtype=str)).fillna("").astype(str)
-    comparable = (expected != "") & (actual != "")
-    if not comparable.any():
+    scores = pd.to_numeric(df.get("type_match_score", pd.Series(dtype=float)), errors="coerce").dropna()
+    if scores.empty:
         return {}
 
-    subset = df[comparable].copy()
-    subset["expected_type"] = expected[comparable]
-    subset["actual_type"] = actual[comparable]
-    matches = subset["expected_type"] == subset["actual_type"]
+    # Recompute counters for per-type coverage stats.
+    expected_counts = df["expected_output"].apply(extract_message_type_counts)
+    actual_counts = df["actual_output"].apply(extract_message_type_counts)
 
-    def pct_for_expected(msg_type: str) -> float:
-        mask = subset["expected_type"] == msg_type
-        if not mask.any():
+    def mismatch_pct_for_expected(msg_type: str) -> float:
+        total_rows = 0
+        mismatch_rows = 0
+        for exp_cnt, act_cnt in zip(expected_counts, actual_counts):
+            if exp_cnt.get(msg_type, 0) > 0:
+                total_rows += 1
+                if act_cnt.get(msg_type, 0) < exp_cnt.get(msg_type, 0):
+                    mismatch_rows += 1
+        if total_rows == 0:
             return 0.0
-        mismatches = (~matches) & mask
-        return float(mismatches.sum() / mask.sum() * 100.0)
+        return float(mismatch_rows / total_rows * 100.0)
 
     return {
-        "rows_with_types": int(len(subset)),
-        "match_rate_pct": float(matches.mean() * 100.0),
-        "mismatch_rate_pct": float((~matches).mean() * 100.0),
-        "list_mismatch_pct": pct_for_expected("interactive_list"),
-        "buttons_mismatch_pct": pct_for_expected("interactive_buttons"),
+        "rows_with_types": int(len(scores)),
+        "avg_type_score": float(scores.mean()),
+        "min_type_score": float(scores.min()),
+        "max_type_score": float(scores.max()),
+        "perfect_count": int((scores == 1.0).sum()),
+        "imperfect_count": int((scores < 1.0).sum()),
+        "list_mismatch_pct": mismatch_pct_for_expected("interactive_list"),
+        "buttons_mismatch_pct": mismatch_pct_for_expected("interactive_buttons"),
     }
 
 
@@ -644,7 +726,10 @@ def render_dataset_editor() -> None:
         df[col] = df[col].apply(lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v)
     df["expected_type"] = df["expected_type"].astype(str)
     df["actual_type"] = df["actual_type"].astype(str)
+    df["expected_type_counts"] = df["expected_type_counts"].astype(str)
+    df["actual_type_counts"] = df["actual_type_counts"].astype(str)
     df["type_match"] = df["type_match"].apply(lambda v: "" if pd.isna(v) else str(bool(v)))
+    df["type_match_score"] = df["type_match_score"].apply(lambda v: "" if pd.isna(v) else round(float(v), 2))
     edited = st.data_editor(
         df,
         num_rows="dynamic",
@@ -661,7 +746,10 @@ def render_dataset_editor() -> None:
             ),
             "expected_type": st.column_config.TextColumn("expected_type", help="Derived message type from expected_output"),
             "actual_type": st.column_config.TextColumn("actual_type", help="Derived message type from actual_output"),
+            "expected_type_counts": st.column_config.TextColumn("expected_type_counts", help="Count of each expected message type"),
+            "actual_type_counts": st.column_config.TextColumn("actual_type_counts", help="Count of each actual message type"),
             "type_match": st.column_config.TextColumn("type_match", help="True when expected_type matches actual_type"),
+            "type_match_score": st.column_config.NumberColumn("type_match_score", format="%.2f", help="Coverage of expected message types (0-1)"),
             "generation_info": st.column_config.TextColumn(
                 "generation_info",
                 required=False,
@@ -712,7 +800,10 @@ def render_styled_table() -> None:
             "generation_info": st.column_config.TextColumn("generation_info", help="API trace for this row"),
             "expected_type": st.column_config.TextColumn("expected_type"),
             "actual_type": st.column_config.TextColumn("actual_type"),
+            "expected_type_counts": st.column_config.TextColumn("expected_type_counts"),
+            "actual_type_counts": st.column_config.TextColumn("actual_type_counts"),
             "type_match": st.column_config.TextColumn("type_match"),
+            "type_match_score": st.column_config.NumberColumn("type_match_score", format="%.2f"),
         },
     )
 
@@ -722,13 +813,42 @@ def render_report(filters: Dict[str, Any]) -> None:
     df = st.session_state.dataset.copy()
     df["judge_score"] = pd.to_numeric(df["judge_score"], errors="coerce")
     type_metrics = compute_type_mismatch_metrics(df)
+    type_scores = pd.to_numeric(df.get("type_match_score", pd.Series(dtype=float)), errors="coerce").dropna()
     if type_metrics:
         st.write("Type comparison")
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Rows with types", type_metrics["rows_with_types"])
-        c2.metric("Type match rate", f"{type_metrics['match_rate_pct']:.1f}%")
-        c3.metric("Mismatch when list expected", f"{type_metrics['list_mismatch_pct']:.1f}%")
-        c4.metric("Mismatch when buttons expected", f"{type_metrics['buttons_mismatch_pct']:.1f}%")
+        c2.metric("Avg type score", f"{type_metrics['avg_type_score']:.2f}")
+        c3.metric("Min type score", f"{type_metrics['min_type_score']:.2f}")
+        c4.metric("Mismatch when list expected", f"{type_metrics['list_mismatch_pct']:.1f}%")
+        c5.metric("Mismatch when buttons expected", f"{type_metrics['buttons_mismatch_pct']:.1f}%")
+        st.info(
+            "Type score measures how many expected message types/counts are covered by the actual output "
+            "(1.0 = full coverage; <1.0 = partial).",
+            icon="ℹ️",
+        )
+        if not type_scores.empty:
+            st.write("Type score range split")
+            type_range_df = pd.DataFrame(
+                {
+                    "range": ["Score == 1", "0.5 < score < 1", "0 < score <= 0.5", "Score == 0"],
+                    "count": [
+                        (type_scores == 1.0).sum(),
+                        ((type_scores > 0.5) & (type_scores < 1.0)).sum(),
+                        ((type_scores > 0.0) & (type_scores <= 0.5)).sum(),
+                        (type_scores == 0.0).sum(),
+                    ],
+                }
+            )
+            type_range_df["percent"] = (type_range_df["count"] / len(type_scores) * 100).round(1).astype(str) + "%"
+            st.dataframe(type_range_df, use_container_width=True, hide_index=True)
+
+            st.write("Type score histogram (0-1)")
+            bins = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+            hist, bin_edges = np.histogram(type_scores, bins=bins)
+            labels = [f"{bin_edges[i]:.1f}-{bin_edges[i+1]:.1f}" for i in range(len(bin_edges) - 1)]
+            hist_df = pd.DataFrame({"range": labels, "count": hist})
+            st.bar_chart(hist_df, x="range", y="count", height=220)
     else:
         st.info("Type comparison pending: add expected/actual outputs with message types to see stats.")
 
